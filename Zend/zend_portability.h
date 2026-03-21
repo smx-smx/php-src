@@ -44,6 +44,8 @@
 # define ZEND_PATHS_SEPARATOR		':'
 #endif
 
+#include "zend_inline.h"
+
 #include "../TSRM/TSRM.h"
 
 #include <stdio.h>
@@ -396,34 +398,6 @@ char *alloca();
 	(_default)
 #endif
 
-#if ZEND_DEBUG || defined(ZEND_WIN32_NEVER_INLINE)
-# define zend_always_inline inline
-# define zend_never_inline
-#else
-# if defined(__GNUC__)
-#  if __GNUC__ >= 3
-#   define zend_always_inline inline __attribute__((always_inline))
-#   define zend_never_inline __attribute__((noinline))
-#  else
-#   define zend_always_inline inline
-#   define zend_never_inline
-#  endif
-# elif defined(_MSC_VER)
-#  define zend_always_inline __forceinline
-#  define zend_never_inline __declspec(noinline)
-# else
-#  if __has_attribute(always_inline)
-#   define zend_always_inline inline __attribute__((always_inline))
-#  else
-#   define zend_always_inline inline
-#  endif
-#  if __has_attribute(noinline)
-#   define zend_never_inline __attribute__((noinline))
-#  else
-#   define zend_never_inline
-#  endif
-# endif
-#endif /* ZEND_DEBUG */
 
 #ifdef PHP_HAVE_BUILTIN_EXPECT
 # define EXPECTED(condition)   __builtin_expect(!!(condition), 1)

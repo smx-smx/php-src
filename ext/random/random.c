@@ -670,7 +670,7 @@ PHPAPI uint64_t php_random_generate_fallback_seed_ex(php_random_fallback_seed_st
 		fallback_seed_add(&c, &pid, sizeof(pid));
 #endif
 #ifdef ZTS
-		tid = tsrm_thread_id();
+		tid = zend_thread_self();
 		fallback_seed_add(&c, &tid, sizeof(tid));
 #endif
 		/* Pointer values to benefit from ASLR. */

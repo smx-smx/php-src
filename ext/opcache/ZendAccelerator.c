@@ -2724,7 +2724,7 @@ ZEND_RINIT_FUNCTION(zend_accelerator)
 
 	if (ZCG(counted)) {
 #ifdef ZTS
-		zend_accel_error(ACCEL_LOG_WARNING, "Stuck count for thread id %lu", (unsigned long) tsrm_thread_id());
+		zend_accel_error(ACCEL_LOG_WARNING, "Stuck count for thread id %lu", (unsigned long) zend_thread_self());
 #else
 		zend_accel_error(ACCEL_LOG_WARNING, "Stuck count for pid %d", getpid());
 #endif

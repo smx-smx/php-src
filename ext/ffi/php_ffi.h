@@ -58,6 +58,15 @@ ZEND_BEGIN_MODULE_GLOBALS(ffi)
 	bool attribute_parsing;
 	bool persistent;
 	uint32_t  default_type_attr;
+
+	/* thread safety */
+	void *mutex;
+	void *cond;
+	void *main_thread;
+	void *deferred_callbacks;
+	void (*orig_interrupt_function)(zend_execute_data *execute_data);
+	zend_internal_function synthetic_ifunc;
+	zend_execute_data synthetic_frame;
 ZEND_END_MODULE_GLOBALS(ffi)
 
 ZEND_EXTERN_MODULE_GLOBALS(ffi)

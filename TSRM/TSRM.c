@@ -453,7 +453,7 @@ TSRM_API void *ts_resource_ex(ts_rsrc_id id, THREAD_T *th_id)
 		return ts_resource_ex(id, &thread_id);
 	} else {
 		 last_thread_resources = &tsrm_tls_table[hash_value];
-		 while (thread_resources->thread_id != thread_id) {
+		 while (!zend_thread_equal(thread_resources->thread_id, thread_id)) {
 			last_thread_resources = &thread_resources->next;
 			if (thread_resources->next) {
 				thread_resources = thread_resources->next;
@@ -479,8 +479,8 @@ TSRM_API void *ts_resource_ex(ts_rsrc_id id, THREAD_T *th_id)
 	 * The fact that this situation happens isn't that bad because a child process containing
 	 * threads will eventually be respawned anyway by the SAPI, so the stale threads won't last
 	 * forever. */
-	TSRM_ASSERT(thread_resources->thread_id == thread_id);
-	if (thread_id == tsrm_thread_id() && !tsrm_tls_get()) {
+	TSRM_ASSERT(zend_thread_equal(thread_resources->thread_id, thread_id));
+	if (zend_thread_equal(thread_id, tsrm_thread_id()) && !tsrm_tls_get()) {
 		tsrm_tls_entry *next = thread_resources->next;
 		/* In case that extensions don't use the pointer passed from the dtor, but incorrectly
 		 * use the global pointer, we need to setup the global pointer temporarily here. */
@@ -521,7 +521,7 @@ void ts_free_thread(void)
 	thread_resources = tsrm_tls_table[hash_value];
 
 	while (thread_resources) {
-		if (thread_resources->thread_id == thread_id) {
+		if (zend_thread_equal(thread_resources->thread_id, thread_id)) {
 			ts_free_resources(thread_resources);
 			if (last) {
 				last->next = thread_resources->next;
@@ -605,48 +605,23 @@ TSRM_API void ts_apply_for_id(ts_rsrc_id id, void (*cb)(void *))
 /* Obtain the current thread id */
 TSRM_API THREAD_T tsrm_thread_id(void)
 {/*{{{*/
-#ifdef TSRM_WIN32
-	return GetCurrentThreadId();
-#else
-	return pthread_self();
-#endif
+	return zend_thread_self();
 }/*}}}*/
 
 
 /* Allocate a mutex */
 TSRM_API MUTEX_T tsrm_mutex_alloc(void)
 {/*{{{*/
-	MUTEX_T mutexp;
-#ifdef TSRM_WIN32
-	mutexp = malloc(sizeof(CRITICAL_SECTION));
-	InitializeCriticalSection(mutexp);
-#else
-	mutexp = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
-	pthread_mutex_init(mutexp,NULL);
-#endif
-#ifdef THR_DEBUG
-	printf("Mutex created thread: %d\n",mythreadid());
-#endif
-	return( mutexp );
+	return zend_mutex_alloc();
 }/*}}}*/
 
 
 /* Free a mutex */
 TSRM_API void tsrm_mutex_free(MUTEX_T mutexp)
 {/*{{{*/
-	if (mutexp) {
-#ifdef TSRM_WIN32
-		DeleteCriticalSection(mutexp);
-		free(mutexp);
-#else
-		pthread_mutex_destroy(mutexp);
-		free(mutexp);
-#endif
-	}
-#ifdef THR_DEBUG
-	printf("Mutex freed thread: %d\n",mythreadid());
-#endif
+	zend_mutex_free(mutexp);
 }/*}}}*/
+
 
 
 /*
@@ -655,13 +630,9 @@ TSRM_API void tsrm_mutex_free(MUTEX_T mutexp)
 */
 TSRM_API int tsrm_mutex_lock(MUTEX_T mutexp)
 {/*{{{*/
-	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Mutex locked thread: %ld", tsrm_thread_id()));
-#ifdef TSRM_WIN32
-	EnterCriticalSection(mutexp);
+	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Mutex locked thread: %ld", (long)tsrm_thread_id()));
+	zend_mutex_lock(mutexp);
 	return 0;
-#else
-	return pthread_mutex_lock(mutexp);
-#endif
 }/*}}}*/
 
 
@@ -671,13 +642,9 @@ TSRM_API int tsrm_mutex_lock(MUTEX_T mutexp)
 */
 TSRM_API int tsrm_mutex_unlock(MUTEX_T mutexp)
 {/*{{{*/
-	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Mutex unlocked thread: %ld", tsrm_thread_id()));
-#ifdef TSRM_WIN32
-	LeaveCriticalSection(mutexp);
+	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Mutex unlocked thread: %ld", (long)tsrm_thread_id()));
+	zend_mutex_unlock(mutexp);
 	return 0;
-#else
-	return pthread_mutex_unlock(mutexp);
-#endif
 }/*}}}*/
 
 /*
@@ -686,7 +653,7 @@ TSRM_API int tsrm_mutex_unlock(MUTEX_T mutexp)
 #ifdef HAVE_SIGPROCMASK
 TSRM_API int tsrm_sigmask(int how, const sigset_t *set, sigset_t *oldset)
 {/*{{{*/
-	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Changed sigmask in thread: %ld", tsrm_thread_id()));
+	TSRM_ERROR((TSRM_ERROR_LEVEL_INFO, "Changed sigmask in thread: %ld", (long)tsrm_thread_id()));
 
     return pthread_sigmask(how, set, oldset);
 }/*}}}*/

@@ -34,6 +34,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include "zend_fibers.h"
+#include "zend_threads.h"
+
 #ifdef HAVE_LIBDL
 #ifdef PHP_WIN32
 #include "win32/param.h"
@@ -912,8 +915,25 @@ typedef struct _zend_ffi_callback_data {
 	ffi_cif                cif;
 	uint32_t               arg_count;
 	ffi_type              *ret_type;
+	/* thread safety */
+	void                  *main_thread;
+	void                  *mutex;
+	void                  *cond;
+	void                  *deferred_callbacks_ptr;
+	void                  *vm_interrupt_ptr;
+	zend_string           *origin_name;
+	zend_execute_data      call_site_frame;
+	zend_execute_data     *call_site_frame_ptr;
 	ffi_type              *arg_types[] ZEND_ELEMENT_COUNT(arg_count);
 } zend_ffi_callback_data;
+
+typedef struct _zend_ffi_deferred_callback {
+	zend_ffi_callback_data *callback_data;
+	void                   *ret;
+	void                  **args;
+	zend_atomic_bool        done;
+	struct _zend_ffi_deferred_callback *next;
+} zend_ffi_deferred_callback;
 
 static void zend_ffi_callback_hash_dtor(zval *zv) /* {{{ */
 {
@@ -931,13 +951,33 @@ static void zend_ffi_callback_hash_dtor(zval *zv) /* {{{ */
 	if (callback_data->ret_type->type == FFI_TYPE_STRUCT) {
 		efree(callback_data->ret_type);
 	}
+	if (callback_data->origin_name) {
+		zend_string_release(callback_data->origin_name);
+	}
 	efree(callback_data);
 }
 /* }}} */
 
-static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, void* data) /* {{{ */
+static ZEND_FUNCTION(zend_ffi_callback_fiber_entry);
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_zend_ffi_callback_fiber_entry, 0, 0, 1)
+	ZEND_ARG_TYPE_INFO(0, deferred, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+static ZEND_FUNCTION(zend_ffi_callback_fiber_entry) /* {{{ */
 {
-	zend_ffi_callback_data *callback_data = (zend_ffi_callback_data*)data;
+	zend_long deferred_addr;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_LONG(deferred_addr)
+	ZEND_PARSE_PARAMETERS_END();
+
+	zend_ffi_deferred_callback *deferred = (zend_ffi_deferred_callback*)deferred_addr;
+	if (deferred->callback_data->call_site_frame.func) {
+		execute_data->prev_execute_data = &deferred->callback_data->call_site_frame;
+	}
+
+	zend_ffi_callback_data *callback_data = deferred->callback_data;
 	zend_fcall_info fci;
 	zend_ffi_type *ret_type;
 	zval retval;
@@ -946,7 +986,191 @@ static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, v
 	fci.size = sizeof(zend_fcall_info);
 	ZVAL_UNDEF(&fci.function_name);
 	fci.retval = &retval;
-	fci.params = do_alloca(sizeof(zval) *callback_data->arg_count, use_heap);
+	fci.params = do_alloca(sizeof(zval) * callback_data->arg_count, use_heap);
+	fci.object = NULL;
+	fci.param_count = callback_data->arg_count;
+	fci.named_params = NULL;
+
+	if (callback_data->type->func.args) {
+		int n = 0;
+		zend_ffi_type *arg_type;
+
+		ZEND_HASH_PACKED_FOREACH_PTR(callback_data->type->func.args, arg_type) {
+			arg_type = ZEND_FFI_TYPE(arg_type);
+			zend_ffi_cdata_to_zval(NULL, deferred->args[n], arg_type, BP_VAR_R, &fci.params[n], (zend_ffi_flags)(arg_type->attr & ZEND_FFI_ATTR_CONST),
+					       false, false);
+			n++;
+		} ZEND_HASH_FOREACH_END();
+	}
+
+	ZVAL_UNDEF(&retval);
+	if (zend_call_function(&fci, &callback_data->fcc) == SUCCESS && !EG(exception)) {
+		ret_type = ZEND_FFI_TYPE(callback_data->type->func.ret_type);
+		if (ret_type->kind != ZEND_FFI_TYPE_VOID) {
+			zend_ffi_zval_to_cdata(deferred->ret, ret_type, &retval);
+#ifdef WORDS_BIGENDIAN
+			if (ret_type->size < sizeof(ffi_arg)
+			 && ret_type->kind >= ZEND_FFI_TYPE_UINT8
+			 && ret_type->kind < ZEND_FFI_TYPE_POINTER) {
+				/* We need to widen the value (zero extend) */
+				switch (ret_type->size) {
+					case 1:
+						*(ffi_arg*)deferred->ret = *(uint8_t*)deferred->ret;
+						break;
+					case 2:
+						*(ffi_arg*)deferred->ret = *(uint16_t*)deferred->ret;
+						break;
+					case 4:
+						*(ffi_arg*)deferred->ret = *(uint32_t*)deferred->ret;
+						break;
+					default:
+						break;
+				}
+			}
+#endif
+		}
+	} else if (!EG(exception)) {
+		zend_throw_error(NULL, "Cannot call callback");
+	}
+
+	if (callback_data->arg_count) {
+		for (uint32_t n = 0; n < callback_data->arg_count; n++) {
+			zval_ptr_dtor(&fci.params[n]);
+		}
+	}
+	free_alloca(fci.params, use_heap);
+	zval_ptr_dtor(&retval);
+
+	zend_atomic_bool_store_ex(&deferred->done, true);
+	zend_mutex_lock((zend_mutex*)FFI_G(mutex));
+	zend_cond_broadcast((zend_cond*)FFI_G(cond));
+	zend_mutex_unlock((zend_mutex*)FFI_G(mutex));
+}
+/* }}} */
+
+static void ffi_interrupt_handler(zend_execute_data *execute_data)
+{
+	zend_ffi_deferred_callback *deferred;
+
+	zend_execute_data *orig_execute_data = EG(current_execute_data);
+	// dummy frame to prevent crash in zend_fetch_debug_backtrace in case of exceptions
+	EG(current_execute_data) = &FFI_G(synthetic_frame);
+
+	while (1) {
+		zend_mutex_lock((zend_mutex*)FFI_G(mutex));
+		deferred = FFI_G(deferred_callbacks);
+		if (deferred) {
+			FFI_G(deferred_callbacks) = deferred->next;
+		}
+		zend_mutex_unlock((zend_mutex*)FFI_G(mutex));
+
+		if (!deferred) {
+			break;
+		}
+
+		/* Build a fresh internal function for each fiber. zend_create_closure
+		* copies the zend_function struct, so this stack copy is safe — the
+		* closure does not retain a pointer to ifunc itself. */
+		zend_internal_function ifunc;
+		memset(&ifunc, 0, sizeof(zend_internal_function));
+		ifunc.type              = ZEND_INTERNAL_FUNCTION;
+		ifunc.handler           = ZEND_FN(zend_ffi_callback_fiber_entry);
+		ifunc.function_name     = deferred->callback_data->origin_name
+			? zend_string_copy(deferred->callback_data->origin_name)
+			: zend_string_init("FFI\\callback_fiber", sizeof("FFI\\callback_fiber") - 1, 0);
+		ifunc.arg_info          = (zend_arg_info*)arginfo_zend_ffi_callback_fiber_entry + 1;
+		ifunc.fn_flags          = ZEND_ACC_PUBLIC;
+		ifunc.num_args          = 1;
+		ifunc.required_num_args = 1;
+
+		zval closure_zv;
+		zend_fiber *fiber = (zend_fiber *)zend_ce_fiber->create_object(zend_ce_fiber);
+		zend_create_closure(&closure_zv, (zend_function *)&ifunc,
+							zend_ce_fiber, zend_ce_fiber, NULL);
+		/* closure copied the func struct; release our name ref */
+		zend_string_release(ifunc.function_name);
+
+		zend_fcall_info ctor_fci;
+		zend_fcall_info_cache ctor_fcc;
+		zval ctor_retval;
+		zval ctor_params[1];
+		ZVAL_COPY_VALUE(&ctor_params[0], &closure_zv);
+
+		ctor_fci.size         = sizeof(zend_fcall_info);
+		ZVAL_UNDEF(&ctor_fci.function_name);
+		ctor_fci.retval       = &ctor_retval;
+		ctor_fci.params       = ctor_params;
+		ctor_fci.object       = &fiber->std;
+		ctor_fci.param_count  = 1;
+		ctor_fci.named_params = NULL;
+
+		ctor_fcc.function_handler = zend_hash_str_find_ptr(
+			&zend_ce_fiber->function_table, "__construct", sizeof("__construct") - 1);
+		ctor_fcc.called_scope = zend_ce_fiber;
+		ctor_fcc.object       = &fiber->std;
+
+		if (zend_call_function(&ctor_fci, &ctor_fcc) != SUCCESS) {
+			zend_throw_error(NULL, "Fiber constructor failed");
+			zval_ptr_dtor(&closure_zv);
+			OBJ_RELEASE(&fiber->std);
+			break;
+		}
+		zval_ptr_dtor(&ctor_retval);
+
+		zval start_params[1];
+		ZVAL_LONG(&start_params[0], (zend_long)deferred);
+
+		zend_fcall_info start_fci;
+		zend_fcall_info_cache start_fcc;
+		zval start_retval;
+
+		start_fci.size         = sizeof(zend_fcall_info);
+		ZVAL_UNDEF(&start_fci.function_name);
+		start_fci.retval       = &start_retval;
+		start_fci.params       = start_params;
+		start_fci.object       = &fiber->std;
+		start_fci.param_count  = 1;
+		start_fci.named_params = NULL;
+
+		start_fcc.function_handler = zend_hash_str_find_ptr(
+			&zend_ce_fiber->function_table, "start", sizeof("start") - 1);
+		start_fcc.called_scope = zend_ce_fiber;
+		start_fcc.object       = &fiber->std;
+
+		if (zend_call_function(&start_fci, &start_fcc) != SUCCESS) {
+			if (!EG(exception)) {
+				zend_throw_error(NULL, "Fiber::start failed");
+			}
+		}
+		zval_ptr_dtor(&start_retval);
+		zval_ptr_dtor(&closure_zv);
+		OBJ_RELEASE(&fiber->std);
+
+		if (EG(exception)) {
+			break;
+		}
+	}
+
+	EG(current_execute_data) = orig_execute_data;
+	FFI_G(synthetic_frame).prev_execute_data = NULL;
+
+	if (FFI_G(orig_interrupt_function)) {
+		FFI_G(orig_interrupt_function)(execute_data);
+	}
+}
+/* }}} */
+
+static zend_never_inline void zend_ffi_callback_trampoline_inner(zend_ffi_callback_data *callback_data, void *ret, void **args) /* {{{ */
+{
+	zend_fcall_info fci;
+	zend_ffi_type *ret_type;
+	zval retval;
+	ALLOCA_FLAG(use_heap)
+
+	fci.size = sizeof(zend_fcall_info);
+	ZVAL_UNDEF(&fci.function_name);
+	fci.retval = &retval;
+	fci.params = do_alloca(sizeof(zval) * callback_data->arg_count, use_heap);
 	fci.object = NULL;
 	fci.param_count = callback_data->arg_count;
 	fci.named_params = NULL;
@@ -965,7 +1189,9 @@ static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, v
 
 	ZVAL_UNDEF(&retval);
 	if (zend_call_function(&fci, &callback_data->fcc) != SUCCESS) {
-		zend_throw_error(zend_ffi_exception_ce, "Cannot call callback");
+		if (!EG(exception)) {
+			zend_throw_error(zend_ffi_exception_ce, "Cannot call callback");
+		}
 	}
 
 	if (callback_data->arg_count) {
@@ -976,7 +1202,9 @@ static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, v
 	free_alloca(fci.params, use_heap);
 
 	if (EG(exception)) {
-		zend_error_noreturn(E_ERROR, "Throwing from FFI callbacks is not allowed");
+		/* Allowing exceptions from FFI callbacks */
+		zval_ptr_dtor(&retval);
+		return;
 	}
 
 	ret_type = ZEND_FFI_TYPE(callback_data->type->func.ret_type);
@@ -1006,6 +1234,38 @@ static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, v
 	}
 
 	zval_ptr_dtor(&retval);
+}
+/* }}} */
+
+static void zend_ffi_callback_trampoline(ffi_cif* cif, void* ret, void** args, void* data) /* {{{ */
+{
+	zend_ffi_callback_data *callback_data = (zend_ffi_callback_data*)data;
+
+	if (!zend_thread_equal(zend_thread_self(), *(zend_thread_id*)callback_data->main_thread)) {
+		zend_ffi_deferred_callback deferred;
+
+		deferred.callback_data = callback_data;
+		deferred.ret = ret;
+		deferred.args = args;
+		ZEND_ATOMIC_BOOL_INIT(&deferred.done, false);
+		deferred.next = NULL;
+
+		zend_mutex_lock((zend_mutex*)callback_data->mutex);
+		deferred.next = *(zend_ffi_deferred_callback**)callback_data->deferred_callbacks_ptr;
+		*(zend_ffi_deferred_callback**)callback_data->deferred_callbacks_ptr = &deferred;
+		zend_mutex_unlock((zend_mutex*)callback_data->mutex);
+
+		zend_atomic_bool_store_ex((zend_atomic_bool*)callback_data->vm_interrupt_ptr, true);
+
+		zend_mutex_lock((zend_mutex*)callback_data->mutex);
+		while (!zend_atomic_bool_load_ex(&deferred.done)) {
+			zend_cond_wait((zend_cond*)callback_data->cond, (zend_mutex*)callback_data->mutex);
+		}
+		zend_mutex_unlock((zend_mutex*)callback_data->mutex);
+		return;
+	}
+
+	zend_ffi_callback_trampoline_inner(callback_data, ret, args);
 }
 /* }}} */
 
@@ -1046,6 +1306,26 @@ static void *zend_ffi_create_callback(zend_ffi_type *type, zval *value) /* {{{ *
 	callback_data->callback = callback;
 	callback_data->code = code;
 	callback_data->arg_count = arg_count;
+
+	/* thread safety */
+	callback_data->main_thread = FFI_G(main_thread);
+	callback_data->mutex = FFI_G(mutex);
+	callback_data->cond = FFI_G(cond);
+	callback_data->deferred_callbacks_ptr = &FFI_G(deferred_callbacks);
+	callback_data->vm_interrupt_ptr = &EG(vm_interrupt);
+
+	if (EG(current_execute_data) && EG(current_execute_data)->func && EG(current_execute_data)->prev_execute_data) {
+		zend_execute_data *caller = EG(current_execute_data)->prev_execute_data;
+		callback_data->origin_name = zend_string_copy(EG(current_execute_data)->func->common.function_name);
+		memset(&callback_data->call_site_frame, 0, sizeof(zend_execute_data));
+		callback_data->call_site_frame.func = caller->func;
+		callback_data->call_site_frame.prev_execute_data = caller->prev_execute_data;
+		callback_data->call_site_frame.opline = caller->opline;
+		callback_data->call_site_frame_ptr = caller;
+	} else {
+		callback_data->origin_name = NULL;
+		memset(&callback_data->call_site_frame, 0, sizeof(zend_execute_data));
+	}
 
 	if (type->func.args) {
 		int n = 0;
@@ -2905,6 +3185,13 @@ static ZEND_FUNCTION(ffi_trampoline) /* {{{ */
 		ZVAL_NULL(return_value);
 	}
 	free_alloca(ret, ret_use_heap);
+
+	if (UNEXPECTED(zend_atomic_bool_load_ex(&EG(vm_interrupt)))) {
+		void (*handler)(zend_execute_data *) = zend_interrupt_function;
+		if (handler) {
+			handler(execute_data);
+		}
+	}
 
 exit:
 	zend_string_release(EX(func)->common.function_name);
@@ -5723,17 +6010,59 @@ static ZEND_GINIT_FUNCTION(ffi)
 	for (i = 0; i < sizeof(zend_ffi_types)/sizeof(zend_ffi_types[0]); i++) {
 		zend_hash_str_add_new_ptr(&ffi_globals->types, zend_ffi_types[i].name, strlen(zend_ffi_types[i].name), (void*)zend_ffi_types[i].type);
 	}
+
+	ffi_globals->mutex = malloc(sizeof(zend_mutex));
+	zend_mutex_init((zend_mutex*)ffi_globals->mutex);
+	ffi_globals->cond = malloc(sizeof(zend_cond));
+	zend_cond_init((zend_cond*)ffi_globals->cond);
+	ffi_globals->main_thread = malloc(sizeof(zend_thread_id));
+	*(zend_thread_id*)ffi_globals->main_thread = zend_thread_self();
+	ffi_globals->orig_interrupt_function = zend_interrupt_function;
+	zend_interrupt_function = ffi_interrupt_handler;
+
+	memset(&ffi_globals->synthetic_ifunc, 0, sizeof(zend_internal_function));
+	ffi_globals->synthetic_ifunc.type = ZEND_INTERNAL_FUNCTION;
+	ffi_globals->synthetic_ifunc.handler = NULL;
+	ffi_globals->synthetic_ifunc.function_name = zend_string_init(
+		"FFI::interrupt_handler", sizeof("FFI::interrupt_handler") - 1, 1); /* persistent */
+	ffi_globals->synthetic_ifunc.fn_flags = ZEND_ACC_CALL_VIA_TRAMPOLINE;
+
+	memset(&ffi_globals->synthetic_frame, 0, sizeof(zend_execute_data));
+	ffi_globals->synthetic_frame.func = (zend_function *)&ffi_globals->synthetic_ifunc;
+	/* don't chain further */
+	ffi_globals->synthetic_frame.prev_execute_data = NULL;
+
 }
 /* }}} */
 
-/* {{{ ZEND_GINIT_FUNCTION */
+/* {{{ ZEND_GSHUTDOWN_FUNCTION */
 static ZEND_GSHUTDOWN_FUNCTION(ffi)
 {
+	if (ffi_globals->mutex) {
+		zend_mutex_destroy((zend_mutex*)ffi_globals->mutex);
+		free(ffi_globals->mutex);
+	}
+	if (ffi_globals->cond) {
+		zend_cond_destroy((zend_cond*)ffi_globals->cond);
+		free(ffi_globals->cond);
+	}
+	if (ffi_globals->main_thread) {
+		free(ffi_globals->main_thread);
+	}
+	if (zend_interrupt_function == ffi_interrupt_handler) {
+		zend_interrupt_function = ffi_globals->orig_interrupt_function;
+	}
+
 	if (ffi_globals->scopes) {
 		zend_hash_destroy(ffi_globals->scopes);
 		free(ffi_globals->scopes);
 	}
 	zend_hash_destroy(&ffi_globals->types);
+
+	if (ffi_globals->synthetic_ifunc.function_name) {
+		zend_string_release(ffi_globals->synthetic_ifunc.function_name);
+		ffi_globals->synthetic_ifunc.function_name = NULL;
+	}
 }
 /* }}} */
 

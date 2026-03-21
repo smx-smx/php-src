@@ -60,13 +60,9 @@ typedef uintptr_t tsrm_uintptr_t;
 typedef int ts_rsrc_id;
 
 /* Define THREAD_T and MUTEX_T */
-#ifdef TSRM_WIN32
-# define THREAD_T DWORD
-# define MUTEX_T CRITICAL_SECTION *
-#else
-# define THREAD_T pthread_t
-# define MUTEX_T pthread_mutex_t *
-#endif
+#include "zend_threads.h"
+#define THREAD_T zend_thread_id
+#define MUTEX_T zend_mutex *
 
 #include <signal.h>
 

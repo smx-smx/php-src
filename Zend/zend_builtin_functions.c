@@ -1533,7 +1533,7 @@ ZEND_FUNCTION(zend_thread_id)
 {
 	ZEND_PARSE_PARAMETERS_NONE();
 
-	RETURN_LONG((zend_long)tsrm_thread_id());
+	RETURN_LONG((zend_long)zend_thread_self());
 }
 #endif
 

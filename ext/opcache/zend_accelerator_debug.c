@@ -53,7 +53,7 @@ static void zend_accel_error_va_args(int type, const char *format, va_list args)
 	}
 
 #ifdef ZTS
-		fprintf(fLog, "%s (" ZEND_ULONG_FMT "): ", time_string, (zend_ulong)tsrm_thread_id());
+		fprintf(fLog, "%s (" ZEND_ULONG_FMT "): ", time_string, (zend_ulong)zend_thread_self());
 #else
 		fprintf(fLog, "%s (%d): ", time_string, getpid());
 #endif

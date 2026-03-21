@@ -14,17 +14,13 @@ $ffi = FFI::cdef($header);
 $ffi->bug79177_cb = function() {
     throw new \RuntimeException('Not allowed');
 };
-try { 
-    $ffi->bug79177(); // this is supposed to raise a fatal error
-} catch (\Throwable $exception) {}
+try {
+    $ffi->bug79177();
+} catch (\Throwable $exception) {
+    echo "Caught: " . $exception->getMessage() . "\n";
+}
 echo "done\n";
 ?>
---EXPECTF--
-Warning: Uncaught RuntimeException: Not allowed in %s:%d
-Stack trace:
-#0 %s(%d): {closure:%s:%d}()
-#1 %s(%d): FFI->bug79177()
-#2 {main}
-  thrown in %s on line %d
-
-Fatal error: Throwing from FFI callbacks is not allowed in %s on line %d
+--EXPECT--
+Caught: Not allowed
+done
