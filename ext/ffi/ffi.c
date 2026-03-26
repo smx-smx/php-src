@@ -924,6 +924,8 @@ typedef struct _zend_ffi_callback_data {
 	zend_string           *origin_name;
 	zend_execute_data      call_site_frame;
 	zend_execute_data     *call_site_frame_ptr;
+	zend_internal_function ffi_func;        /* fake func for async backtrace */
+	zend_execute_data     *ffi_call_frame;  /* heap-allocated fake FFI call frame (+ trailing arg zvals) */
 	ffi_type              *arg_types[] ZEND_ELEMENT_COUNT(arg_count);
 } zend_ffi_callback_data;
 
@@ -954,6 +956,14 @@ static void zend_ffi_callback_hash_dtor(zval *zv) /* {{{ */
 	if (callback_data->origin_name) {
 		zend_string_release(callback_data->origin_name);
 	}
+	if (callback_data->ffi_call_frame) {
+		uint32_t num_args = ZEND_CALL_NUM_ARGS(callback_data->ffi_call_frame);
+		for (uint32_t i = 0; i < num_args; i++) {
+			zval_ptr_dtor(ZEND_CALL_ARG(callback_data->ffi_call_frame, i + 1));
+		}
+		zval_ptr_dtor(&callback_data->ffi_call_frame->This);
+		efree(callback_data->ffi_call_frame);
+	}
 	efree(callback_data);
 }
 /* }}} */
@@ -973,9 +983,6 @@ static ZEND_FUNCTION(zend_ffi_callback_fiber_entry) /* {{{ */
 	ZEND_PARSE_PARAMETERS_END();
 
 	zend_ffi_deferred_callback *deferred = (zend_ffi_deferred_callback*)deferred_addr;
-	if (deferred->callback_data->call_site_frame.func) {
-		execute_data->prev_execute_data = &deferred->callback_data->call_site_frame;
-	}
 
 	zend_ffi_callback_data *callback_data = deferred->callback_data;
 	zend_fcall_info fci;
@@ -1003,8 +1010,22 @@ static ZEND_FUNCTION(zend_ffi_callback_fiber_entry) /* {{{ */
 		} ZEND_HASH_FOREACH_END();
 	}
 
+	/* Temporarily redirect EG(current_execute_data) to the fake FFI call frame so
+	 * that the closure's prev_execute_data chains through it.
+	 * This gives debug_backtrace() the same structure as the synchronous (trampoline) path:
+	 *   closure -> ffi_call_frame (CALL_VIA_TRAMPOLINE) -> call_site_frame (PHP opline)
+	 * producing the correct file/line for frame #0 and "FFI->func()" for frame #1. */
+	zend_execute_data *saved_execute_data = EG(current_execute_data);
+	if (callback_data->ffi_call_frame) {
+		EG(current_execute_data) = callback_data->ffi_call_frame;
+	}
+
 	ZVAL_UNDEF(&retval);
-	if (zend_call_function(&fci, &callback_data->fcc) == SUCCESS && !EG(exception)) {
+	zend_result call_result = zend_call_function(&fci, &callback_data->fcc);
+
+	EG(current_execute_data) = saved_execute_data;
+
+	if (call_result == SUCCESS && !EG(exception)) {
 		ret_type = ZEND_FFI_TYPE(callback_data->type->func.ret_type);
 		if (ret_type->kind != ZEND_FFI_TYPE_VOID) {
 			zend_ffi_zval_to_cdata(deferred->ret, ret_type, &retval);
@@ -1322,9 +1343,44 @@ static void *zend_ffi_create_callback(zend_ffi_type *type, zval *value) /* {{{ *
 		callback_data->call_site_frame.prev_execute_data = caller->prev_execute_data;
 		callback_data->call_site_frame.opline = caller->opline;
 		callback_data->call_site_frame_ptr = caller;
+
+		/* Build a fake internal-function frame that mirrors what the live ffi_trampoline
+		 * execute_data looks like in the synchronous path.  Having CALL_VIA_TRAMPOLINE
+		 * set on ffi_func makes zend_fetch_debug_backtrace walk through it (rather than
+		 * stopping), so the closure call site picks up the correct PHP file/line (#0) and
+		 * the frame itself shows "FFI->funcname(arg, ...)" (#1).
+		 *
+		 * The PHP-level arguments passed to the FFI function (e.g. the four arguments of
+		 * pthread_create) are captured now, while the live ffi_trampoline execute_data is
+		 * still on the stack, and stored in the trailing zval slots of the allocated frame
+		 * so that debug_backtrace_get_args() can read them later. */
+		memset(&callback_data->ffi_func, 0, sizeof(zend_internal_function));
+		callback_data->ffi_func.type          = ZEND_INTERNAL_FUNCTION;
+		callback_data->ffi_func.fn_flags      = ZEND_ACC_CALL_VIA_TRAMPOLINE | ZEND_ACC_PUBLIC;
+		callback_data->ffi_func.function_name = callback_data->origin_name; /* shared ref – not addref'd again */
+		callback_data->ffi_func.scope         = EG(current_execute_data)->func->common.scope;
+
+		uint32_t num_php_args = ZEND_CALL_NUM_ARGS(EG(current_execute_data));
+		callback_data->ffi_call_frame = emalloc(
+			sizeof(zend_execute_data) + num_php_args * sizeof(zval));
+		memset(callback_data->ffi_call_frame, 0, sizeof(zend_execute_data));
+		callback_data->ffi_call_frame->func              = (zend_function *)&callback_data->ffi_func;
+		callback_data->ffi_call_frame->prev_execute_data = &callback_data->call_site_frame;
+		ZEND_CALL_NUM_ARGS(callback_data->ffi_call_frame) = num_php_args;
+		for (uint32_t i = 0; i < num_php_args; i++) {
+			ZVAL_COPY(ZEND_CALL_ARG(callback_data->ffi_call_frame, i + 1),
+			          ZEND_CALL_ARG(EG(current_execute_data), i + 1));
+		}
+		if (Z_TYPE(EG(current_execute_data)->This) == IS_OBJECT) {
+			ZVAL_COPY(&callback_data->ffi_call_frame->This, &EG(current_execute_data)->This);
+		} else {
+			ZVAL_UNDEF(&callback_data->ffi_call_frame->This);
+		}
 	} else {
 		callback_data->origin_name = NULL;
 		memset(&callback_data->call_site_frame, 0, sizeof(zend_execute_data));
+		memset(&callback_data->ffi_func, 0, sizeof(zend_internal_function));
+		callback_data->ffi_call_frame = NULL;
 	}
 
 	if (type->func.args) {

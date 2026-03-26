@@ -24,10 +24,7 @@ $array[0] = 2;
 $array[1] = 1;
 $qsort_callback = function($a, $b) {
     echo "In qsort callback:\n";
-    $trace = debug_backtrace();
-    foreach ($trace as $frame) {
-        echo "  - " . ($frame['function'] ?? 'unknown') . "\n";
-    }
+    debug_print_backtrace();
     return 0;
 };
 $ffi->qsort($array, 2, 4, $qsort_callback);
@@ -35,10 +32,7 @@ $ffi->qsort($array, 2, 4, $qsort_callback);
 echo "\n--- Asynchronous (pthread_create) ---\n";
 $pthread_callback = function($arg) {
     echo "In pthread callback:\n";
-    $trace = debug_backtrace();
-    foreach ($trace as $frame) {
-        echo "  - " . ($frame['function'] ?? 'unknown') . "\n";
-    }
+    debug_print_backtrace();
     return null;
 };
 
@@ -56,10 +50,10 @@ $ffi->pthread_join($thread->cdata, null);
 --EXPECTF--
 --- Synchronous (qsort) ---
 In qsort callback:
-  - {closure:%s:%d}
-  - qsort
+#0 %sbacktraces.php(21): {closure:%s:%d}(Object(FFI\CData:void*), Object(FFI\CData:void*))
+#1 %sbacktraces.php(21): FFI->qsort(Object(FFI\CData:int32_t[2]), 2, 4, Object(Closure))
 
 --- Asynchronous (pthread_create) ---
 In pthread callback:
-  - {closure:%s:%d}
-  - pthread_create
+#0 %sbacktraces.php(31): {closure:%s:%d}(NULL)
+#1 %sbacktraces.php(31): FFI->pthread_create(Object(FFI\CData:%s), NULL, Object(Closure), NULL)
